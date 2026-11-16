@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
+import argparse
 import os
 import yaml
 from tqdm import tqdm
@@ -11,9 +12,11 @@ import time
 
 # Custom Imports
 from src.models.siamese_main import AttentionalSiameseNetwork
-from src.data.lfw_dataset import LFWDataset
+from src.data.lfw_dataset import LFWDataset, PairListDataset
+from src.data.splits import read_pairs, read_people
 from src.data.transforms import get_transforms
-from src.utils.metrics import calculate_accuracy
+from src.utils.metrics import accuracy_at, calculate_accuracy, predict_probs, roc_auc
+from src.utils.seed import set_seed
 from src.utils.visualization import save_attention_map, plot_loss_curve
 
 # --- Load Configuration ---
@@ -34,22 +37,22 @@ UNFREEZE_EPOCH = config.get("unfreeze_epoch", 5)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Ensure directories exist
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(os.path.join(LOG_DIR, "vis"), exist_ok=True)
 
-def train_one_epoch(model, loader, criterion, optimizer, epoch, writer):
+def train_one_epoch(model, loader, criterion, optimizer, epoch, writer, max_batches=None):
     model.train()
     running_loss = 0.0
     running_acc = 0.0
-    
+    n_batches = 0
+
     # scaler = torch.amp.GradScaler('cuda') # AMP Disabled due to NaN instability
-    
-    
+
+
     loop = tqdm(loader, desc=f"Train Epoch [{epoch+1}/{NUM_EPOCHS}]")
-    
+
     for batch_idx, (img1, img2, labels) in enumerate(loop):
+        if max_batches is not None and batch_idx >= max_batches:
+            break  # smoke-test mode (CPU)
+        n_batches += 1
         img1, img2 = img1.to(DEVICE), img2.to(DEVICE)
         labels = labels.to(DEVICE).float().view(-1, 1)
         
@@ -85,44 +88,30 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, writer):
             writer.add_scalar('Training/Batch_Loss', loss.item(), global_step)
             writer.add_scalar('Training/Batch_Accuracy', acc.item(), global_step)
 
-    avg_loss = running_loss / len(loader)
-    avg_acc = running_acc / len(loader)
+    avg_loss = running_loss / n_batches
+    avg_acc = running_acc / n_batches
     return avg_loss, avg_acc
 
-def evaluate(model, loader, criterion, epoch, writer, split="Val"):
-    model.eval()
-    running_loss = 0.0
-    running_acc = 0.0
-    
-    with torch.no_grad():
-        loop = tqdm(loader, desc=f"{split} Epoch [{epoch+1}/{NUM_EPOCHS}]")
-        for batch_idx, (img1, img2, labels) in enumerate(loop):
-            img1, img2 = img1.to(DEVICE), img2.to(DEVICE)
-            labels = labels.to(DEVICE).float().view(-1, 1)
-            
-            outputs, attn_map = model(img1, img2)
-            loss = criterion(outputs, labels)
-            probs = torch.sigmoid(outputs)
-            acc = calculate_accuracy(probs, labels)
-            
-            running_loss += loss.item()
-            running_acc += acc.item()
-            
-            # Save visualization for the first batch of the first few epochs
-            if batch_idx == 0:
-                # Visualize the first pair in the batch
-                save_attention_map(
-                    img1[0], img2[0], attn_map[0], 
-                    probs[0].item(), labels[0].item(), 
-                    epoch+1, batch_idx, 
-                    save_dir=os.path.join(LOG_DIR, "vis")
-                )
+def validate(model, val_loader, val_dataset, criterion, epoch):
+    """Validation on the FIXED val pairs via the shared eval helper.
+    Returns (loss, auc, acc@0.5). The test split is never touched during training."""
+    probs, labels, val_loss = predict_probs(model, val_loader, DEVICE, criterion=criterion)
+    val_auc = roc_auc(labels, probs)
+    val_acc = accuracy_at(labels, probs, 0.5)
 
-    avg_loss = running_loss / len(loader)
-    avg_acc = running_acc / len(loader)
-    return avg_loss, avg_acc
+    # Attention visualisation for the first (fixed) val pair
+    img1, img2, label = val_dataset[0]
+    with torch.inference_mode():
+        _, attn_map = model(img1.unsqueeze(0).to(DEVICE), img2.unsqueeze(0).to(DEVICE))
+    save_attention_map(img1, img2, attn_map[0], float(probs[0]), label.item(),
+                       epoch + 1, 0, save_dir=os.path.join(LOG_DIR, "vis"))
+    return val_loss, val_auc, val_acc
 
-def main():
+def main(max_batches=None, num_workers=8):
+    set_seed(config["seed"])
+    # Ensure directories exist (after CLI overrides are applied)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(os.path.join(LOG_DIR, "vis"), exist_ok=True)
     print(f"Using device: {DEVICE}")
     if DEVICE.type == 'cpu':
         print("WARNING: You are training on CPU. This will be slow!")
@@ -132,26 +121,28 @@ def main():
     
     # 1. Data Preparation
     print("Initializing Datasets...")
+    splits_dir = config["splits_dir"]
+    # Training: random on-the-fly pairs over TRAIN people only
     train_dataset = LFWDataset(
-        root_dir=DATASET_PATH, 
-        transform=get_transforms(split='train', input_size=INPUT_SHAPE), 
-        split='train',
-        train_ratio=config.get("train_split_ratio", 0.8),
+        root_dir=DATASET_PATH,
+        transform=get_transforms(split='train', input_size=INPUT_SHAPE),
+        people=read_people(os.path.join(splits_dir, "train_people.txt")),
         cache_images=False
     )
-    
-    # Validation/Test Dataset (Test split from LFW)
-    # In one-shot context, this is our "unseen" people evaluation
-    test_dataset = LFWDataset(
-        root_dir=DATASET_PATH, 
-        transform=get_transforms(split='test', input_size=INPUT_SHAPE), 
-        split='test',
-        train_ratio=config.get("train_split_ratio", 0.8),
-        cache_images=False
+
+    # Validation: FIXED pairs over VAL people (disjoint from train and test).
+    # Used for checkpoint selection and LR scheduling. Test is only read by evaluate.py.
+    val_dataset = PairListDataset(
+        DATASET_PATH,
+        read_pairs(os.path.join(splits_dir, "val_pairs.csv")),
+        transform=get_transforms(split='test', input_size=INPUT_SHAPE),
     )
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True, prefetch_factor=2)
+
+    loader_kw = dict(num_workers=num_workers, pin_memory=DEVICE.type == "cuda")
+    if num_workers > 0:
+        loader_kw["prefetch_factor"] = 2
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, **loader_kw)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, **loader_kw)
     
     # 2. Model, Loss, Optimizer
     # We freeze the backbone to speed up training and prevent overfitting on small data
@@ -166,7 +157,7 @@ def main():
     train_losses = []
     val_losses = []
     
-    best_acc = 0.0
+    best_auc = -1.0
 
     # 3. Training Loop
     print("Starting Training...")
@@ -183,36 +174,31 @@ def main():
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, verbose=True)
 
         # Train
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, epoch, writer)
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, epoch, writer, max_batches)
         train_losses.append(train_loss)
-        
-        # Validate every epoch
-        if True: # Run every epoch
-            val_loss, val_acc = evaluate(model, test_loader, criterion, epoch, writer, split="Test")
-            val_losses.append(val_loss)
-            
-            # Step Scheduler
-            scheduler.step(val_loss)
 
-            print(f"Epoch {epoch+1}" 
-                  f"\tTrain Loss: {train_loss:.4f} \tTrain Acc: {train_acc:.4f}"
-                  f"\tVal Loss: {val_loss:.4f} \tVal Acc: {val_acc:.4f}")
-            
-            # TensorBoard
-            writer.add_scalars('Epoch/Loss', {'Train': train_loss, 'Val': val_loss}, epoch+1)
-            writer.add_scalars('Epoch/Accuracy', {'Train': train_acc, 'Val': val_acc}, epoch+1)
+        # Validate every epoch on the fixed val pairs
+        val_loss, val_auc, val_acc = validate(model, val_loader, val_dataset, criterion, epoch)
+        val_losses.append(val_loss)
 
-            # Checkpoint
-            if val_acc > best_acc:
-                best_acc = val_acc
-                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/best_model.pth")
-                print("Saved Best Model!")
-        else:
-             print(f"Epoch {epoch+1}" 
-                  f"\tTrain Loss: {train_loss:.4f} \tTrain Acc: {train_acc:.4f}")
-             writer.add_scalar('Epoch/Loss/Train', train_loss, epoch+1)
-             writer.add_scalar('Epoch/Accuracy/Train', train_acc, epoch+1)
-            
+        # Step Scheduler
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch+1}"
+              f"\tTrain Loss: {train_loss:.4f} \tTrain Acc: {train_acc:.4f}"
+              f"\tVal Loss: {val_loss:.4f} \tVal AUC: {val_auc:.4f} \tVal Acc@0.5: {val_acc:.4f}")
+
+        # TensorBoard
+        writer.add_scalars('Epoch/Loss', {'Train': train_loss, 'Val': val_loss}, epoch+1)
+        writer.add_scalars('Epoch/Accuracy', {'Train': train_acc, 'Val': val_acc}, epoch+1)
+        writer.add_scalar('Epoch/Val_AUC', val_auc, epoch+1)
+
+        # Checkpoint selection on val AUC (threshold-free); test is never consulted
+        if val_auc > best_auc:
+            best_auc = val_auc
+            torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/best_model.pth")
+            print(f"Saved Best Model (val AUC {val_auc:.4f})")
+
         # Save regular checkpoint
         torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/last_model.pth")
 
@@ -223,4 +209,17 @@ def main():
     plot_loss_curve(train_losses, val_losses, save_path=os.path.join(LOG_DIR, "loss_curve.png"))
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--epochs", type=int, default=None, help="override num_epochs from config.yaml")
+    ap.add_argument("--max-batches", type=int, default=None, help="cap train batches per epoch (CPU smoke test)")
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--checkpoint-dir", default=None, help="override checkpoint_dir (keep smoke runs out of checkpoints/)")
+    ap.add_argument("--log-dir", default=None, help="override log_dir")
+    args = ap.parse_args()
+    if args.epochs is not None:
+        NUM_EPOCHS = args.epochs
+    if args.checkpoint_dir is not None:
+        CHECKPOINT_DIR = args.checkpoint_dir
+    if args.log_dir is not None:
+        LOG_DIR = args.log_dir
+    main(max_batches=args.max_batches, num_workers=args.num_workers)

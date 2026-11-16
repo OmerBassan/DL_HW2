@@ -16,7 +16,28 @@ with open("config.yaml", "r") as f:
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def predict(img1_path, img2_path, model_path=None):
+def verdict(logit, threshold=0.5):
+    """Map the model's raw logit to (probability, label string).
+
+    The model returns logits (trained with BCEWithLogitsLoss), so the sigmoid
+    must be applied here before comparing to a probability threshold.
+    """
+    prob = torch.sigmoid(torch.as_tensor(float(logit))).item()
+    result = "SAME PERSON" if prob > threshold else "DIFFERENT PEOPLE"
+    return prob, result
+
+def upsample_attention(attn_map, size=(224, 224)):
+    """Resize a [1, 1, h, w] attention map to an (H, W) numpy array for overlay.
+
+    The model already returns a 4-D [B, 1, 7, 7] map, which is what interpolate
+    expects; adding a batch dim made it 5-D and crashed.
+    """
+    assert attn_map.dim() == 4 and attn_map.shape[:2] == (1, 1), attn_map.shape
+    return torch.nn.functional.interpolate(
+        attn_map, size=size, mode='bilinear', align_corners=False
+    ).squeeze().cpu().numpy()
+
+def predict(img1_path, img2_path, model_path=None, threshold=0.5):
     # 1. Transformation
     transform = get_transforms(split='test')
     
@@ -47,17 +68,13 @@ def predict(img1_path, img2_path, model_path=None):
     with torch.no_grad():
         prediction, attn_map = model(img1_t, img2_t)
         
-    prob = prediction.item()
-    result = "SAME PERSON" if prob > 0.5 else "DIFFERENT PEOPLE"
+    prob, result = verdict(prediction.item(), threshold)
     
-    print(f"\nPrediction: {prob:.4f}")
+    print(f"\nP(same person): {prob:.4f}  (threshold {threshold})")
     print(f"Result: {result}")
-    
+
     # 4. Visualization
-    # Resize attn map
-    attn_resized = torch.nn.functional.interpolate(
-        attn_map.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False
-    ).squeeze().cpu().numpy()
+    attn_resized = upsample_attention(attn_map, size=(224, 224))
     
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     axes[0].imshow(img1)
@@ -83,7 +100,8 @@ if __name__ == "__main__":
     parser.add_argument("--img1", type=str, required=True, help="Path to first image")
     parser.add_argument("--img2", type=str, required=True, help="Path to second image")
     parser.add_argument("--model", type=str, default=None, help="Path to .pth model file")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Probability threshold (use the val-tuned value from evaluate.py)")
     
     args = parser.parse_args()
     
-    predict(args.img1, args.img2, args.model)
+    predict(args.img1, args.img2, args.model, args.threshold)

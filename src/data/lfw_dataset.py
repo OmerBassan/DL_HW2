@@ -8,8 +8,42 @@ from torch.utils.data import Dataset
 import numpy as np
 from tqdm import tqdm
 
+class PairListDataset(Dataset):
+    """Fixed, deterministic pairs for validation/test: item idx is always pair idx.
+
+    pairs: list of (name1, num1, name2, num2, label), e.g. from
+    src.data.splits.read_pairs(). A missing image raises instead of being
+    silently replaced, because a substituted pair would change the eval set.
+    """
+
+    def __init__(self, root_dir, pairs, transform=None):
+        from src.data.splits import image_path
+        self.transform = transform
+        self.items = [
+            (image_path(root_dir, n1, k1), image_path(root_dir, n2, k2), float(label))
+            for n1, k1, n2, k2, label in pairs
+        ]
+        missing = [p for it in self.items for p in it[:2] if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} pair images missing, e.g. {missing[:2]}")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        p1, p2, label = self.items[idx]
+        img1 = Image.open(p1).convert("RGB")
+        img2 = Image.open(p2).convert("RGB")
+        if self.transform:
+            img1, img2 = self.transform(img1), self.transform(img2)
+        return img1, img2, torch.tensor(label, dtype=torch.float32)
+
+
 class LFWDataset(Dataset):
-    def __init__(self, root_dir, transform=None, split='train', train_ratio=0.8, cache_images=False):
+    """Random on-the-fly pairs over a set of people. Use for TRAINING only:
+    pairs are re-drawn on every access, so it is not a fixed evaluation set."""
+
+    def __init__(self, root_dir, transform=None, split='train', train_ratio=0.8, cache_images=False, people=None):
         """
         LFW Dataset for Siamese Network.
         
@@ -25,27 +59,21 @@ class LFWDataset(Dataset):
         self.split = split
         self.cache_images = cache_images
         
-        # 1. Get all people (identities)
-        # We assume the structure is root_dir/person_name/image.jpg
-        all_people = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
-        all_people.sort() # Ensure deterministic order
-        
-        # Filter people with at least 2 images for the "Positive" pairs?
-        # Actually, for one-shot testing we might need people with only 1 image?
-        # But to *train* a Siamese network we need positive pairs, so we need people with >= 2 images.
-        # People with 1 image can only be used for Negative pairs.
-        
-        # For simplicity and robustness, let's just split all people.
-        # Using a deterministic shuffle based on a seed so split is always same
-        random.seed(42) 
-        random.shuffle(all_people)
-        
-        split_idx = int(len(all_people) * train_ratio)
-        
-        if split == 'train':
-            self.people = all_people[:split_idx]
+        if people is not None:
+            # Preferred: explicit identity list from src.data.splits (train_people.txt)
+            self.people = sorted(people)
         else:
-            self.people = all_people[split_idx:]
+            # LEGACY 80/20 split (kept so old commands still run). Note it reseeds
+            # the GLOBAL `random` module as a side effect.
+            all_people = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+            all_people.sort() # Ensure deterministic order
+            random.seed(42)
+            random.shuffle(all_people)
+            split_idx = int(len(all_people) * train_ratio)
+            if split == 'train':
+                self.people = all_people[:split_idx]
+            else:
+                self.people = all_people[split_idx:]
             
         print(f"[{split.upper()}] Dataset initialized with {len(self.people)} people.")
         
