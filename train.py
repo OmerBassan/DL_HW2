@@ -38,6 +38,18 @@ UNFREEZE_EPOCH = config.get("unfreeze_epoch", 5)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def build_optimizer(model):
+    """The ONE place the optimizer and LR scheduler are built.
+
+    Used both at the start and when the backbone is unfrozen (the optimizer must
+    be rebuilt so it includes the newly trainable parameters). Two hand-copied
+    constructions drifted before: only the unfreeze copy passed `verbose=True`,
+    which newer PyTorch rejects, so training crashed at UNFREEZE_EPOCH.
+    """
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
+    return optimizer, scheduler
+
 def train_one_epoch(model, loader, criterion, optimizer, epoch, writer, max_batches=None):
     model.train()
     running_loss = 0.0
@@ -148,8 +160,7 @@ def main(max_batches=None, num_workers=8):
     # We freeze the backbone to speed up training and prevent overfitting on small data
     model = AttentionalSiameseNetwork(input_shape=INPUT_SHAPE, dropout_prob=DROPOUT_PROB, freeze_backbone=True).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
+    optimizer, scheduler = build_optimizer(model)
     
     writer = SummaryWriter(log_dir=LOG_DIR)
     
@@ -169,9 +180,7 @@ def main(max_batches=None, num_workers=8):
             model.unfreeze_backbone()
             # We must re-initialize the optimizer to include the newly unfrozen parameters
             # We keep the low learning rate (or make it even lower if desired)
-            optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-            # Re-attach scheduler
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, verbose=True)
+            optimizer, scheduler = build_optimizer(model)
 
         # Train
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, epoch, writer, max_batches)
