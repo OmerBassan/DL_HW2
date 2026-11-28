@@ -1,7 +1,16 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+
+# Cosine head initialisation. cos lies in [0, 1] here because the features are
+# post-ReLU (non-negative), so |logit| <= MAX_SCALE * (1 + |bias|).
+INIT_SCALE = 10.0
+INIT_BIAS = 0.5
+MAX_SCALE = 100.0  # upper clamp on the learned scale (as in CLIP's logit_scale)
+
 
 class AttentionalSiameseNetwork(nn.Module):
     def __init__(self, input_shape=(224, 224), dropout_prob=0.0, freeze_backbone=False):
@@ -25,8 +34,14 @@ class AttentionalSiameseNetwork(nn.Module):
         # ResNet34 output is [Batch, 512, 7, 7] (same channels as 18, but deeper features)
         self.feature_backbone = nn.Sequential(*list(resnet_features.children())[:-2])
         
-        # --- שלב 3: (Final Layer) ---
-        self.final_layer = nn.Linear(1, 1)
+        # --- שלב 3: Cosine scoring head ---
+        # logit = scale * (cos - bias). Replaces Linear(1,1) on a raw sum of
+        # 25,088 squared differences, whose range (10,778-62,837 at init) pinned
+        # sigmoid at exactly 1.0 for every pair and overflowed fp16.
+        # scale is kept positive (exp of a log), so higher cosine always means
+        # "more likely same"; the old Linear weight had to learn its own sign.
+        self.log_scale = nn.Parameter(torch.tensor(math.log(INIT_SCALE)))
+        self.bias = nn.Parameter(torch.tensor(INIT_BIAS))
 
         # Dropout Layer
         self.dropout = nn.Dropout2d(p=dropout_prob) if dropout_prob > 0 else nn.Identity()
@@ -39,8 +54,8 @@ class AttentionalSiameseNetwork(nn.Module):
         # Ensure these are always trainable
         for param in self.attn_conv.parameters():
             param.requires_grad = True
-        for param in self.final_layer.parameters():
-            param.requires_grad = True
+        self.log_scale.requires_grad = True
+        self.bias.requires_grad = True
         
     def _freeze_weights(self, model):
         for param in model.parameters():
@@ -92,26 +107,24 @@ class AttentionalSiameseNetwork(nn.Module):
         feat1_deep = self.dropout(feat1_deep)
         feat2_deep = self.dropout(feat2_deep)
         
-        # --- שלב C: חישוב המרחק הגולמי ---
-        # המרחק האוקלידי בריבוע (לפני סכימה מרחבית)
-        # Shape: [Batch, 512, 7, 7]
-        raw_diff = torch.pow(feat1_deep - feat2_deep, 2)
-        
-        # --- שלב D: Soft Gating (הליבה של המודל) ---
-        # אנו מכפילים את ההפרש במפת הקשב.
-        # אם ה-attention_mask בפיקסל מסוים הוא 0 (רקע), ההפרש שם מתאפס.
-        # אנו מבצעים Broadcasting כדי להתאים את המימדים
-        gated_diff = raw_diff * attention_mask
-        
-        # שלב E: סכימה למרחק
-        distance = torch.sum(gated_diff, dim=[1, 2, 3]) # [Batch_Size]
-        
-        # שלב F: המרה להסתברות עם Bias נלמד
-        # אנו צריכים לשנות את הצורה ל-[Batch_Size, 1] כדי להכניס לשכבה הליניארית
-        distance = distance.view(-1, 1)
-        
-        # מעבירים דרך השכבה הליניארית (Distance * w + bias)
-        logits = self.final_layer(distance)
-        
+        logits = self.score(feat1_deep, feat2_deep, attention_mask)
+
         # Return Logits directly for BCEWithLogitsLoss
         return logits, attention_mask
+
+    def score(self, feat1, feat2, attention_mask):
+        """[B,C,H,W] feature maps + [B,1,H,W] mask -> [B,1] same-person logits.
+
+        --- Soft Gating (הליבה של המודל) ---
+        Each map is multiplied by the shared attention mask, flattened, and the
+        two are compared with cosine similarity. Locations still correspond one
+        to one (the same cell of both photos is compared), and a cell with mask
+        ~0 contributes ~nothing, as before. Cosine is invariant to the overall
+        size of the features and of the mask, so the logit cannot grow with
+        feature magnitude: |logit| <= MAX_SCALE * (1 + |bias|).
+        """
+        g1 = (feat1 * attention_mask).flatten(1)
+        g2 = (feat2 * attention_mask).flatten(1)
+        cos = F.cosine_similarity(g1, g2, dim=1, eps=1e-8)  # [B]; 0 if a map is all-zero
+        scale = self.log_scale.exp().clamp(max=MAX_SCALE)
+        return (scale * (cos - self.bias)).view(-1, 1)
