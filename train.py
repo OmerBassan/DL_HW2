@@ -25,7 +25,8 @@ with open("config.yaml", "r") as f:
 
 # Hyperparameters
 BATCH_SIZE = config.get("batch_size", 32)
-LEARNING_RATE = config.get("learning_rate", 1e-4)
+LEARNING_RATE = config.get("learning_rate", 1e-4)  # backbones (after unfreeze)
+HEAD_LEARNING_RATE = config.get("head_learning_rate", 1e-3)  # attn_conv + cosine head
 NUM_EPOCHS = config.get("num_epochs", 20)
 WEIGHT_DECAY = config.get("weight_decay", 1e-5)
 DATASET_PATH = config.get("dataset_path", "data/lfw")
@@ -45,8 +46,18 @@ def build_optimizer(model):
     be rebuilt so it includes the newly trainable parameters). Two hand-copied
     constructions drifted before: only the unfreeze copy passed `verbose=True`,
     which newer PyTorch rejects, so training crashed at UNFREEZE_EPOCH.
+
+    Two parameter groups: the head gets HEAD_LEARNING_RATE, the backbones get
+    LEARNING_RATE. Adam moves a weight by roughly lr per step, so at 5e-5 for
+    ~2,100 steps the head's log_scale could move only ~0.1 in the whole run.
+    Every parameter is listed, frozen or not, so the optimizer built at
+    unfreeze covers the whole model (AdamW skips parameters with no grad).
     """
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    groups = [
+        {"params": model.head_parameters(), "lr": HEAD_LEARNING_RATE},
+        {"params": model.backbone_parameters(), "lr": LEARNING_RATE},
+    ]
+    optimizer = optim.AdamW(groups, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
     return optimizer, scheduler
 
@@ -74,7 +85,11 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, writer, max_batc
         # Forward (No AMP)
         outputs, attn_map = model(img1, img2)
         loss = criterion(outputs, labels)
-        
+        if not torch.isfinite(loss):
+            # Fail fast: a NaN at epoch 2 would otherwise burn every remaining epoch.
+            raise FloatingPointError(
+                f"non-finite training loss {loss.item()} at epoch {epoch + 1}, batch {batch_idx}")
+
         # Backward
         loss.backward()
         

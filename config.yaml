@@ -1,6 +1,7 @@
 # Hyperparameters & Configuration
 batch_size: 64
-learning_rate: 0.00005
+learning_rate: 0.00005      # backbones, once unfrozen
+head_learning_rate: 0.001   # attention conv + cosine head (scale, bias), from epoch 0
 num_epochs: 15
 weight_decay: 0.00001 # Regularization
 

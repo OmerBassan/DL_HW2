@@ -47,10 +47,15 @@ class AttentionalSiameseNetwork(nn.Module):
         self.dropout = nn.Dropout2d(p=dropout_prob) if dropout_prob > 0 else nn.Identity()
 
         # הקפאת משקולות (אופציונלי - תלוי באסטרטגיית האימון שלך)
+        # While frozen, train() also keeps both backbones in eval mode, so their
+        # BatchNorm layers keep the ImageNet running statistics instead of
+        # overwriting them with LFW batch statistics (requires_grad=False alone
+        # does not stop running-stat updates).
+        self.backbone_frozen = freeze_backbone
         if freeze_backbone:
              self._freeze_weights(self.attention_backbone)
              self._freeze_weights(self.feature_backbone)
-             
+
         # Ensure these are always trainable
         for param in self.attn_conv.parameters():
             param.requires_grad = True
@@ -61,6 +66,20 @@ class AttentionalSiameseNetwork(nn.Module):
         for param in model.parameters():
             param.requires_grad = False
 
+    def train(self, mode=True):
+        super().train(mode)
+        if self.backbone_frozen:
+            self.attention_backbone.eval()
+            self.feature_backbone.eval()
+        return self
+
+    def head_parameters(self):
+        """Parameters trained from epoch 0: the attention conv and the cosine head."""
+        return [*self.attn_conv.parameters(), self.log_scale, self.bias]
+
+    def backbone_parameters(self):
+        return [*self.attention_backbone.parameters(), *self.feature_backbone.parameters()]
+
     def unfreeze_backbone(self):
         """Unfreezes the backbone for fine-tuning."""
         print("Unfreezing backbones for fine-tuning...")
@@ -68,6 +87,8 @@ class AttentionalSiameseNetwork(nn.Module):
             param.requires_grad = True
         for param in self.feature_backbone.parameters():
             param.requires_grad = True
+        self.backbone_frozen = False
+        self.train(self.training)  # backbones now follow the model's mode
 
     def forward_attention(self, img1, img2):
         """
